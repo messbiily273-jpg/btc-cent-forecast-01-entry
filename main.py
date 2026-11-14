@@ -15,6 +15,14 @@ last 4-hour move. Coefficients are deliberately small: at a 4-hour horizon
 BTC is close to a random walk, and an OLS fit of the same features flips
 sign between halves of the validation data, so anything larger would be
 fitting noise. No network, no randomness, stdlib only, deterministic.
+
+Structure: :func:`forecast` is a thin composition over three helpers.
+:func:`clean_prices` sanitises the raw series, :func:`mean_reversion_gap`
+measures how far the last log-price sits from its 6-hour geometric mean,
+and :func:`recent_move` measures the log-price move over the last 4 hours.
+Splitting the helpers out keeps each step testable on its own without
+changing any arithmetic: the forecast formula below is byte-for-byte the
+same computation as the original single-function version.
 """
 import json
 import math
@@ -39,10 +47,13 @@ def price5(x):
     return round(min(MAX_PRICE, max(MIN_PRICE, x)) * 1e5) / 1e5
 
 
-def forecast(prices):
-    """One 4h-ahead price guess from 72h of 1-minute closes."""
-    if not prices:
-        raise ValueError("no prices")
+def clean_prices(prices):
+    """Return usable closes as floats, forward-filling bad entries.
+
+    A bad entry (non-number, non-finite, or non-positive) is replaced by
+    the most recent good price. Bad entries before the first good price
+    are dropped, since there is nothing to fill them from.
+    """
     clean = []
     last_good = None
     for p in prices:
@@ -53,14 +64,44 @@ def forecast(prices):
             clean.append(last_good)
     if not clean:
         raise ValueError("no usable prices")
-    n = len(clean)
-    w = min(W_MEANREV, n)
-    h = min(H_TREND, n - 1)
-    lp = [math.log(p) for p in clean]
-    last = lp[-1]
-    mean_w = sum(lp[-w:]) / w
-    move = last - lp[-1 - h] if h > 0 else 0.0
-    return price5(math.exp(last + A_MEANREV * (mean_w - last) + B_TREND * move))
+    return clean
+
+
+def mean_reversion_gap(log_prices, window=W_MEANREV):
+    """Log gap between the 6h geometric mean and the last log-price.
+
+    The geometric mean of the last ``window`` prices is the arithmetic
+    mean of their logs, so the gap is ``mean(logs[-window:]) - logs[-1]``.
+    Positive when the recent mean sits above the last price: the forecast
+    is then pulled upward. The window is capped at the series length.
+    """
+    w = min(window, len(log_prices))
+    mean_w = sum(log_prices[-w:]) / w
+    return mean_w - log_prices[-1]
+
+
+def recent_move(log_prices, horizon=H_TREND):
+    """Log-price move over the last ``horizon`` minutes.
+
+    Returns ``logs[-1] - logs[-1 - horizon]``; zero when the series is too
+    short to span the horizon (fewer than two usable prices). Positive
+    after a rally: the forecast is then pulled downward, against the move.
+    """
+    h = min(horizon, len(log_prices) - 1)
+    if h <= 0:
+        return 0.0
+    return log_prices[-1] - log_prices[-1 - h]
+
+
+def forecast(prices):
+    """One 4h-ahead price guess from 72h of 1-minute closes."""
+    if not prices:
+        raise ValueError("no prices")
+    log_prices = [math.log(p) for p in clean_prices(prices)]
+    last = log_prices[-1]
+    gap = mean_reversion_gap(log_prices)
+    move = recent_move(log_prices)
+    return price5(math.exp(last + A_MEANREV * gap + B_TREND * move))
 
 
 def main():
